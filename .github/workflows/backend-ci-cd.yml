@@ -1,0 +1,87 @@
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "k8s/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ECR_REPOSITORY: starttech-backend-api
+  CLUSTER_NAME: starttech-cluster
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Run tests
+        working-directory: backend
+        run: go test ./...
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image (tagged with git SHA)
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: docker build -t "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" backend/
+
+      - name: Vulnerability scan (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Push image to ECR
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      - name: Update k8s/deployment.yaml with new image tag
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          sed -i "s|image: .*starttech-backend-api.*|image: ${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}|" k8s/deployment.yaml
+          grep "image:" k8s/deployment.yaml
+
+      - name: Connect to EKS
+        run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "${{ secrets.AWS_REGION }}"
+
+      - name: Create/refresh application secret
+        run: |
+          kubectl create secret generic backend-api-secrets \
+            --from-literal=MONGO_URI='${{ secrets.MONGO_URI }}' \
+            --from-literal=REDIS_HOST='${{ secrets.REDIS_HOST }}' \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy manifests
+        run: kubectl apply -f k8s/
+
+      - name: Verify rollout
+        run: kubectl rollout status deployment/backend-api --timeout=300s
